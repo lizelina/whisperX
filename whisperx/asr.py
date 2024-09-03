@@ -241,7 +241,73 @@ class FasterWhisperPipeline(Pipeline):
 
         return {"segments": segments, "language": language}
 
+    def transcribe_with_segments(
+            self, audio: Union[str, np.ndarray], segments, batch_size=None, num_workers=0, language=None, task=None,
+            chunk_size=30, print_progress=False, combined_progress=False
+    ) -> TranscriptionResult:
+        if isinstance(audio, str):
+            audio = load_audio(audio)
 
+        def data(audio, segments):
+            for seg in segments:
+                f1 = int(seg['start'] * SAMPLE_RATE)
+                f2 = int(seg['end'] * SAMPLE_RATE)
+                # print(f2-f1)
+                yield {'inputs': audio[f1:f2]}
+
+        # vad_segments = self.vad_model({"waveform": torch.from_numpy(audio).unsqueeze(0), "sample_rate": SAMPLE_RATE})
+        vad_segments = segments
+        if self.tokenizer is None:
+            language = language or self.detect_language(audio)
+            task = task or "transcribe"
+            self.tokenizer = faster_whisper.tokenizer.Tokenizer(self.model.hf_tokenizer,
+                                                                self.model.model.is_multilingual, task=task,
+                                                                language=language)
+        else:
+            language = language or self.tokenizer.language_code
+            task = task or self.tokenizer.task
+            if task != self.tokenizer.task or language != self.tokenizer.language_code:
+                self.tokenizer = faster_whisper.tokenizer.Tokenizer(self.model.hf_tokenizer,
+                                                                    self.model.model.is_multilingual, task=task,
+                                                                    language=language)
+
+        if self.suppress_numerals:
+            previous_suppress_tokens = self.options.suppress_tokens
+            numeral_symbol_tokens = find_numeral_symbol_tokens(self.tokenizer)
+            print(f"Suppressing numeral and symbol tokens")
+            new_suppressed_tokens = numeral_symbol_tokens + self.options.suppress_tokens
+            new_suppressed_tokens = list(set(new_suppressed_tokens))
+            self.options = self.options._replace(suppress_tokens=new_suppressed_tokens)
+
+        segments: List[SingleSegment] = []
+        batch_size = batch_size or self._batch_size
+        total_segments = len(vad_segments)
+        for idx, out in enumerate(
+                self.__call__(data(audio, vad_segments), batch_size=batch_size, num_workers=num_workers)):
+            if print_progress:
+                base_progress = ((idx + 1) / total_segments) * 100
+                percent_complete = base_progress / 2 if combined_progress else base_progress
+                print(f"Progress: {percent_complete:.2f}%...")
+            text = out['text']
+            if batch_size in [0, 1, None]:
+                text = text[0]
+            segments.append(
+                {
+                    "text": text,
+                    "start": round(vad_segments[idx]['start'], 3),
+                    "end": round(vad_segments[idx]['end'], 3)
+                }
+            )
+
+        # revert the tokenizer if multilingual inference is enabled
+        if self.preset_language is None:
+            self.tokenizer = None
+
+        # revert suppressed tokens if suppress_numerals is enabled
+        if self.suppress_numerals:
+            self.options = self.options._replace(suppress_tokens=previous_suppress_tokens)
+
+        return {"segments": segments, "language": language}
     def detect_language(self, audio: np.ndarray):
         if audio.shape[0] < N_SAMPLES:
             print("Warning: audio is shorter than 30s, language detection may be inaccurate.")
